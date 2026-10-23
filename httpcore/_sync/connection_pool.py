@@ -10,6 +10,7 @@ from .._backends.base import SOCKET_OPTION, NetworkBackend
 from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
 from .._models import Origin, Proxy, Request, Response
 from .._synchronization import Event, ShieldCancellation, ThreadLock
+from .._utils import get_timeout
 from .connection import HTTPConnection
 from .interfaces import ConnectionInterface, RequestInterface
 
@@ -28,10 +29,13 @@ class PoolRequest:
         self.connection = None
         self._connection_acquired = Event()
 
-    def wait_for_connection(
-        self, timeout: float | None = None
-    ) -> ConnectionInterface:
+    def wait_for_connection(self) -> ConnectionInterface:
         if self.connection is None:
+            # Tighten the pool wait against any absolute deadline on each
+            # iteration through the wait. An expired deadline raises a
+            # `PoolTimeout` immediately, without entering the wait.
+            timeouts = self.request.extensions.get("timeout", {})
+            timeout = get_timeout(timeouts, "pool")
             self._connection_acquired.wait(timeout=timeout)
         assert self.connection is not None
         return self.connection
@@ -212,9 +216,6 @@ class ConnectionPool(RequestInterface):
                 f"Request URL has an unsupported protocol '{scheme}://'."
             )
 
-        timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("pool", None)
-
         with self._optional_thread_lock:
             # Add the incoming request to our request queue.
             pool_request = PoolRequest(request)
@@ -229,7 +230,9 @@ class ConnectionPool(RequestInterface):
                 self._close_connections(closing)
 
                 # Wait until this request has an assigned connection.
-                connection = pool_request.wait_for_connection(timeout=timeout)
+                # The pool timeout, including any deadline tightening, is
+                # recomputed on every iteration inside `wait_for_connection`.
+                connection = pool_request.wait_for_connection()
 
                 try:
                     # Send the request on the assigned connection.

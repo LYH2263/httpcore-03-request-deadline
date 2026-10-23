@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import ssl
+import typing
 
 import socksio
 
@@ -12,6 +13,7 @@ from .._models import URL, Origin, Request, Response, enforce_bytes, enforce_url
 from .._ssl import default_ssl_context
 from .._synchronization import AsyncLock
 from .._trace import Trace
+from .._utils import get_timeout
 from .connection_pool import AsyncConnectionPool
 from .http11 import AsyncHTTP11Connection
 from .interfaces import AsyncConnectionInterface
@@ -45,7 +47,12 @@ async def _init_socks5_connection(
     host: bytes,
     port: int,
     auth: tuple[bytes, bytes] | None = None,
+    timeouts: typing.Mapping[str, typing.Any] | None = None,
 ) -> None:
+    # The SOCKS handshake is part of establishing the connection, so all of
+    # its waits are tightened against the "connect" budget, including any
+    # absolute deadline.
+    timeouts = {} if timeouts is None else timeouts
     conn = socksio.socks5.SOCKS5Connection()
 
     # Auth method request
@@ -56,10 +63,12 @@ async def _init_socks5_connection(
     )
     conn.send(socksio.socks5.SOCKS5AuthMethodsRequest([auth_method]))
     outgoing_bytes = conn.data_to_send()
-    await stream.write(outgoing_bytes)
+    await stream.write(outgoing_bytes, timeout=get_timeout(timeouts, "connect"))
 
     # Auth method response
-    incoming_bytes = await stream.read(max_bytes=4096)
+    incoming_bytes = await stream.read(
+        max_bytes=4096, timeout=get_timeout(timeouts, "connect")
+    )
     response = conn.receive_data(incoming_bytes)
     assert isinstance(response, socksio.socks5.SOCKS5AuthReply)
     if response.method != auth_method:
@@ -75,10 +84,12 @@ async def _init_socks5_connection(
         username, password = auth
         conn.send(socksio.socks5.SOCKS5UsernamePasswordRequest(username, password))
         outgoing_bytes = conn.data_to_send()
-        await stream.write(outgoing_bytes)
+        await stream.write(outgoing_bytes, timeout=get_timeout(timeouts, "connect"))
 
         # Username/password response
-        incoming_bytes = await stream.read(max_bytes=4096)
+        incoming_bytes = await stream.read(
+            max_bytes=4096, timeout=get_timeout(timeouts, "connect")
+        )
         response = conn.receive_data(incoming_bytes)
         assert isinstance(response, socksio.socks5.SOCKS5UsernamePasswordReply)
         if not response.success:
@@ -91,10 +102,12 @@ async def _init_socks5_connection(
         )
     )
     outgoing_bytes = conn.data_to_send()
-    await stream.write(outgoing_bytes)
+    await stream.write(outgoing_bytes, timeout=get_timeout(timeouts, "connect"))
 
     # Connect response
-    incoming_bytes = await stream.read(max_bytes=4096)
+    incoming_bytes = await stream.read(
+        max_bytes=4096, timeout=get_timeout(timeouts, "connect")
+    )
     response = conn.receive_data(incoming_bytes)
     assert isinstance(response, socksio.socks5.SOCKS5Reply)
     if response.reply_code != socksio.socks5.SOCKS5ReplyCode.SUCCEEDED:
@@ -216,27 +229,30 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
     async def handle_async_request(self, request: Request) -> Response:
         timeouts = request.extensions.get("timeout", {})
         sni_hostname = request.extensions.get("sni_hostname", None)
-        timeout = timeouts.get("connect", None)
 
         async with self._connect_lock:
             if self._connection is None:
                 try:
-                    # Connect to the proxy
-                    kwargs = {
+                    # Connect to the proxy. The connect timeout is tightened
+                    # against any absolute deadline.
+                    kwargs: dict[str, typing.Any] = {
                         "host": self._proxy_origin.host.decode("ascii"),
                         "port": self._proxy_origin.port,
-                        "timeout": timeout,
+                        "timeout": get_timeout(timeouts, "connect"),
                     }
                     async with Trace("connect_tcp", logger, request, kwargs) as trace:
                         stream = await self._network_backend.connect_tcp(**kwargs)
                         trace.return_value = stream
 
-                    # Connect to the remote host using socks5
+                    # Connect to the remote host using socks5. Each read and
+                    # write in the handshake is tightened against the remaining
+                    # connect budget.
                     kwargs = {
                         "stream": stream,
                         "host": self._remote_origin.host.decode("ascii"),
                         "port": self._remote_origin.port,
                         "auth": self._proxy_auth,
+                        "timeouts": timeouts,
                     }
                     async with Trace(
                         "setup_socks5_connection", logger, request, kwargs
@@ -260,7 +276,7 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
                             "ssl_context": ssl_context,
                             "server_hostname": sni_hostname
                             or self._remote_origin.host.decode("ascii"),
-                            "timeout": timeout,
+                            "timeout": get_timeout(timeouts, "connect"),
                         }
                         async with Trace("start_tls", logger, request, kwargs) as trace:
                             stream = await stream.start_tls(**kwargs)

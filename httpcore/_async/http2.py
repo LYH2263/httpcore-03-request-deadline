@@ -21,6 +21,7 @@ from .._exceptions import (
 from .._models import Origin, Request, Response
 from .._synchronization import AsyncLock, AsyncSemaphore, AsyncShieldCancellation
 from .._trace import Trace
+from .._utils import get_timeout
 from .interfaces import AsyncConnectionInterface
 
 logger = logging.getLogger("httpcore.http2")
@@ -432,13 +433,15 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
 
     async def _read_incoming_data(self, request: Request) -> list[h2.events.Event]:
         timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("read", None)
 
         if self._read_exception is not None:
             raise self._read_exception  # pragma: nocover
 
         try:
-            data = await self._network_stream.read(self.READ_NUM_BYTES, timeout)
+            # Tighten against the deadline immediately before the read.
+            data = await self._network_stream.read(
+                self.READ_NUM_BYTES, get_timeout(timeouts, "read")
+            )
             if data == b"":
                 raise RemoteProtocolError("Server disconnected")
         except Exception as exc:
@@ -460,7 +463,6 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
 
     async def _write_outgoing_data(self, request: Request) -> None:
         timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("write", None)
 
         async with self._write_lock:
             data_to_send = self._h2_state.data_to_send()
@@ -469,7 +471,13 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 raise self._write_exception  # pragma: nocover
 
             try:
-                await self._network_stream.write(data_to_send, timeout)
+                # Tighten against the deadline immediately before the write.
+                # An empty payload requires no I/O, so the write deadline is
+                # only enforced when there is actually data to send.
+                if data_to_send:
+                    await self._network_stream.write(
+                        data_to_send, get_timeout(timeouts, "write")
+                    )
             except Exception as exc:  # pragma: nocover
                 # If we get a network error we should:
                 #

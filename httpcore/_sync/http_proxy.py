@@ -19,6 +19,7 @@ from .._models import (
 from .._ssl import default_ssl_context
 from .._synchronization import Lock
 from .._trace import Trace
+from .._utils import get_timeout
 from .connection import HTTPConnection
 from .connection_pool import ConnectionPool
 from .http11 import HTTP11Connection
@@ -264,7 +265,6 @@ class TunnelHTTPConnection(ConnectionInterface):
 
     def handle_request(self, request: Request) -> Response:
         timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("connect", None)
 
         with self._connect_lock:
             if not self._connected:
@@ -307,10 +307,14 @@ class TunnelHTTPConnection(ConnectionInterface):
                 alpn_protocols = ["http/1.1", "h2"] if self._http2 else ["http/1.1"]
                 ssl_context.set_alpn_protocols(alpn_protocols)
 
+                # The CONNECT exchange and proxy connection above already
+                # honour the request's connect/read/write timeouts and any
+                # deadline. Tighten the tunnel TLS handshake against the
+                # remaining connect budget right before it starts.
                 kwargs = {
                     "ssl_context": ssl_context,
                     "server_hostname": self._remote_origin.host.decode("ascii"),
-                    "timeout": timeout,
+                    "timeout": get_timeout(timeouts, "connect"),
                 }
                 with Trace("start_tls", logger, request, kwargs) as trace:
                     stream = stream.start_tls(**kwargs)

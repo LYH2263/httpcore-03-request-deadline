@@ -10,6 +10,7 @@ from .._backends.base import SOCKET_OPTION, AsyncNetworkBackend
 from .._exceptions import ConnectionNotAvailable, UnsupportedProtocol
 from .._models import Origin, Proxy, Request, Response
 from .._synchronization import AsyncEvent, AsyncShieldCancellation, AsyncThreadLock
+from .._utils import get_timeout
 from .connection import AsyncHTTPConnection
 from .interfaces import AsyncConnectionInterface, AsyncRequestInterface
 
@@ -28,10 +29,13 @@ class AsyncPoolRequest:
         self.connection = None
         self._connection_acquired = AsyncEvent()
 
-    async def wait_for_connection(
-        self, timeout: float | None = None
-    ) -> AsyncConnectionInterface:
+    async def wait_for_connection(self) -> AsyncConnectionInterface:
         if self.connection is None:
+            # Tighten the pool wait against any absolute deadline on each
+            # iteration through the wait. An expired deadline raises a
+            # `PoolTimeout` immediately, without entering the wait.
+            timeouts = self.request.extensions.get("timeout", {})
+            timeout = get_timeout(timeouts, "pool")
             await self._connection_acquired.wait(timeout=timeout)
         assert self.connection is not None
         return self.connection
@@ -212,9 +216,6 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 f"Request URL has an unsupported protocol '{scheme}://'."
             )
 
-        timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("pool", None)
-
         with self._optional_thread_lock:
             # Add the incoming request to our request queue.
             pool_request = AsyncPoolRequest(request)
@@ -229,7 +230,9 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 await self._close_connections(closing)
 
                 # Wait until this request has an assigned connection.
-                connection = await pool_request.wait_for_connection(timeout=timeout)
+                # The pool timeout, including any deadline tightening, is
+                # recomputed on every iteration inside `wait_for_connection`.
+                connection = await pool_request.wait_for_connection()
 
                 try:
                     # Send the request on the assigned connection.

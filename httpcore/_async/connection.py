@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import logging
 import ssl
+import time
 import types
 import typing
 
@@ -13,6 +14,7 @@ from .._models import Origin, Request, Response
 from .._ssl import default_ssl_context
 from .._synchronization import AsyncLock
 from .._trace import Trace
+from .._utils import get_timeout
 from .http11 import AsyncHTTP11Connection
 from .interfaces import AsyncConnectionInterface
 
@@ -105,15 +107,18 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
     async def _connect(self, request: Request) -> AsyncNetworkStream:
         timeouts = request.extensions.get("timeout", {})
         sni_hostname = request.extensions.get("sni_hostname", None)
-        timeout = timeouts.get("connect", None)
 
         retries_left = self._retries
         delays = exponential_backoff(factor=RETRIES_BACKOFF_FACTOR)
 
         while True:
+            # The connect timeout is tightened against the deadline on every
+            # attempt. An expired deadline raises `ConnectTimeout` without
+            # entering another connect attempt, so it is never retried.
+            timeout = get_timeout(timeouts, "connect")
             try:
                 if self._uds is None:
-                    kwargs = {
+                    kwargs: dict[str, typing.Any] = {
                         "host": self._origin.host.decode("ascii"),
                         "port": self._origin.port,
                         "local_address": self._local_address,
@@ -146,11 +151,13 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
                     alpn_protocols = ["http/1.1", "h2"] if self._http2 else ["http/1.1"]
                     ssl_context.set_alpn_protocols(alpn_protocols)
 
+                    # Re-tighten against the remaining budget after the TCP
+                    # connection, since it may have consumed some of it.
                     kwargs = {
                         "ssl_context": ssl_context,
                         "server_hostname": sni_hostname
                         or self._origin.host.decode("ascii"),
-                        "timeout": timeout,
+                        "timeout": get_timeout(timeouts, "connect"),
                     }
                     async with Trace("start_tls", logger, request, kwargs) as trace:
                         stream = await stream.start_tls(**kwargs)
@@ -161,6 +168,15 @@ class AsyncHTTPConnection(AsyncConnectionInterface):
                     raise
                 retries_left -= 1
                 delay = next(delays)
+                # The backoff sleep must not exceed the remaining budget.
+                # If the deadline has already elapsed we fail immediately
+                # rather than sleeping or attempting another connection.
+                deadline = timeouts.get("deadline")
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        raise ConnectTimeout()
+                    delay = min(delay, remaining)
                 async with Trace("retry", logger, request, kwargs) as trace:
                     await self._network_backend.sleep(delay)
 

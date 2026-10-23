@@ -20,6 +20,7 @@ from .._exceptions import (
 from .._models import Origin, Request, Response
 from .._synchronization import Lock, ShieldCancellation
 from .._trace import Trace
+from .._utils import get_timeout
 from .interfaces import ConnectionInterface
 
 logger = logging.getLogger("httpcore.http11")
@@ -139,7 +140,6 @@ class HTTP11Connection(ConnectionInterface):
 
     def _send_request_headers(self, request: Request) -> None:
         timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("write", None)
 
         with map_exceptions({h11.LocalProtocolError: LocalProtocolError}):
             event = h11.Request(
@@ -147,22 +147,25 @@ class HTTP11Connection(ConnectionInterface):
                 target=request.url.target,
                 headers=request.headers,
             )
-        self._send_event(event, timeout=timeout)
+        self._send_event(event, timeout=get_timeout(timeouts, "write"))
 
     def _send_request_body(self, request: Request) -> None:
         timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("write", None)
 
         assert isinstance(request.stream, typing.Iterable)
         for chunk in request.stream:
             event = h11.Data(data=chunk)
-            self._send_event(event, timeout=timeout)
+            self._send_event(event, timeout=get_timeout(timeouts, "write"))
 
-        self._send_event(h11.EndOfMessage(), timeout=timeout)
+        self._send_event(
+            h11.EndOfMessage(), timeout=get_timeout(timeouts, "write")
+        )
 
     def _send_event(self, event: h11.Event, timeout: float | None = None) -> None:
         bytes_to_send = self._h11_state.send(event)
-        if bytes_to_send is not None:
+        # Only enter the write when there is actually data to send, so that
+        # an expired write deadline cannot trigger on a no-op.
+        if bytes_to_send:
             self._network_stream.write(bytes_to_send, timeout=timeout)
 
     # Receiving the response...
@@ -171,10 +174,9 @@ class HTTP11Connection(ConnectionInterface):
         self, request: Request
     ) -> tuple[bytes, int, bytes, list[tuple[bytes, bytes]], bytes]:
         timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("read", None)
 
         while True:
-            event = self._receive_event(timeout=timeout)
+            event = self._receive_event(timeouts)
             if isinstance(event, h11.Response):
                 break
             if (
@@ -197,25 +199,26 @@ class HTTP11Connection(ConnectionInterface):
         self, request: Request
     ) -> typing.Iterator[bytes]:
         timeouts = request.extensions.get("timeout", {})
-        timeout = timeouts.get("read", None)
 
         while True:
-            event = self._receive_event(timeout=timeout)
+            event = self._receive_event(timeouts)
             if isinstance(event, h11.Data):
                 yield bytes(event.data)
             elif isinstance(event, (h11.EndOfMessage, h11.PAUSED)):
                 break
 
     def _receive_event(
-        self, timeout: float | None = None
+        self, timeouts: typing.Mapping[str, float | None]
     ) -> h11.Event | type[h11.PAUSED]:
         while True:
             with map_exceptions({h11.RemoteProtocolError: RemoteProtocolError}):
                 event = self._h11_state.next_event()
 
             if event is h11.NEED_DATA:
+                # Tighten against the deadline immediately before each
+                # network read, including multiple reads within one event.
                 data = self._network_stream.read(
-                    self.READ_NUM_BYTES, timeout=timeout
+                    self.READ_NUM_BYTES, timeout=get_timeout(timeouts, "read")
                 )
 
                 # If we feed this case through h11 we'll raise an exception like:

@@ -3,6 +3,56 @@ from __future__ import annotations
 import select
 import socket
 import sys
+import time
+import typing
+
+from ._exceptions import (
+    ConnectTimeout,
+    PoolTimeout,
+    ReadTimeout,
+    WriteTimeout,
+)
+
+# The timeout exception that applies when the absolute deadline has elapsed
+# for each of the four configurable timeout phases.
+_DEADLINE_TIMEOUT_EXCEPTIONS = {
+    "pool": PoolTimeout,
+    "connect": ConnectTimeout,
+    "read": ReadTimeout,
+    "write": WriteTimeout,
+}
+
+
+def get_timeout(
+    timeouts: typing.Mapping[str, typing.Optional[float]], phase: str
+) -> typing.Optional[float]:
+    """
+    Return the effective timeout in seconds for a given phase.
+
+    `timeouts` is the request's `"timeout"` extension mapping, which may
+    include an optional `"deadline"` key, holding an absolute point in time
+    on the `time.monotonic()` clock.
+
+    * When no deadline is configured, the phase timeout is returned
+      unchanged, preserving the existing behaviour.
+    * Otherwise the remaining budget (`deadline - time.monotonic()`) is used
+      to tighten the phase timeout. If the phase timeout is `None`, then the
+      remaining budget is used. Otherwise the smaller of the two is used.
+    * If the remaining budget is zero or negative, then the matching timeout
+      exception for the phase is raised immediately, without entering the
+      wait or I/O operation.
+    """
+    timeout = timeouts.get(phase)
+    deadline = timeouts.get("deadline")
+    if deadline is None:
+        return timeout
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.0:
+        raise _DEADLINE_TIMEOUT_EXCEPTIONS[phase]()
+    if timeout is None:
+        return remaining
+    return min(timeout, remaining)
 
 
 def is_socket_readable(sock: socket.socket | None) -> bool:
